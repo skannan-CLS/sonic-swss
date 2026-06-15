@@ -147,7 +147,7 @@ end
 
 local function get_gearbox_interface_info(interface_name)
     local base_name, suffix
-    
+
     -- Check if it ends with _line
     if string.match(interface_name, "_line$") then
         base_name = string.gsub(interface_name, "_line$", "")
@@ -172,12 +172,12 @@ local function find_gearbox_lanes_and_serdes(interface_name)
     local _
     local count, lane_speed, serdes = 0, 0, 0
     local base_interface_name, lane_type = get_gearbox_interface_info(interface_name)
-    
+
     redis.call('SELECT', appl_db)
     if base_interface_name and lane_type then
         local lanes = port_interface_gearbox_map[base_interface_name][lane_type]
         local speed = redis.call('HGET', appl_db_port ..':'..base_interface_name, 'speed')
-        
+
         if lanes then
             _, count = string.gsub(lanes, ",", ",")
             count = count + 1
@@ -190,6 +190,24 @@ local function find_gearbox_lanes_and_serdes(interface_name)
     return count, lane_speed, serdes
 end
 
+-- PFC RX & TX rate counter object
+
+local PfcCounter = {}
+PfcCounter.__index = PfcCounter
+
+function PfcCounter.new(index, mode)
+    local self = setmetatable({}, PfcCounter)
+    self.index = index
+    self.mode = mode
+    self.value = -1
+    self.value_last = -1
+    self.rate = -1
+    self.rate_last = -1
+    self.counter_name = "SAI_PORT_STAT_PFC_" .. index .. "_" .. mode .. "_PKTS"
+    self.counter_name_last = self.counter_name .. "_last"
+    self.rate_name = "PFC_" .. index .. "_" .. mode .. "_PPS"
+    return self
+end
 
 -- find the max T - Maximum FEC histogram bin with non-zero count
 -- return max T value
@@ -228,13 +246,13 @@ local function compute_ber(port)
         else
             lanes_count, lanes_speed, serdes_speed = find_lanes_and_serdes(interface_name)
         end
- 
+
         if lanes_count and serdes_speed then
             fec_corr_bits = redis.call('HGET', counters_table_name .. ':' .. port, 'SAI_PORT_STAT_IF_IN_FEC_CORRECTED_BITS')
             fec_uncorr_frames = redis.call('HGET', counters_table_name .. ':' .. port, 'SAI_PORT_STAT_IF_IN_FEC_NOT_CORRECTABLE_FRAMES')
         end
     end
-        
+
     if fec_corr_bits and fec_uncorr_frames and lanes_count and serdes_speed then
         local fec_corr_bits_last = redis.call('HGET', rates_table_name .. ':' .. port, 'SAI_PORT_STAT_IF_FEC_CORRECTED_BITS_last')
         local fec_uncorr_frames_last = redis.call('HGET', rates_table_name .. ':' .. port, 'SAI_PORT_STAT_IF_FEC_NOT_CORRECTABLE_FARMES_last')
@@ -252,7 +270,7 @@ local function compute_ber(port)
     end
 
     -- do not update FEC related stat if we dont have it
-    
+
     if not fec_corr_bits or not fec_uncorr_frames or not fec_corr_bits_ber_new or
        not fec_uncorr_bits_ber_new then
         logit("FEC counters not found on " .. port)
@@ -282,6 +300,14 @@ local function compute_rate(port)
         return
     end
 
+    -- Initialize PFC Tx & Rx rate counters for all 8 priority groups
+    local pfc_tx_counters = {}
+    local pfc_rx_counters = {}
+    for i = 0, 7 do
+        pfc_tx_counters[i] = PfcCounter.new(i, "TX")
+        pfc_rx_counters[i] = PfcCounter.new(i, "RX")
+    end
+
     local state_table = rates_table_name .. ':' .. port .. ':' .. 'PORT'
     local initialized = redis.call('HGET', state_table, 'INIT_DONE')
     logit(initialized)
@@ -293,6 +319,16 @@ local function compute_rate(port)
     local out_non_ucast_pkts = redis.call('HGET', counters_table_name .. ':' .. port, 'SAI_PORT_STAT_IF_OUT_NON_UCAST_PKTS')
     local in_octets = redis.call('HGET', counters_table_name .. ':' .. port, 'SAI_PORT_STAT_IF_IN_OCTETS')
     local out_octets = redis.call('HGET', counters_table_name .. ':' .. port, 'SAI_PORT_STAT_IF_OUT_OCTETS')
+
+    for i = 0, 7 do
+        pfc_tx_counters[i].value = tonumber(redis.call('HGET', counters_table_name .. ':' .. port, pfc_tx_counters[i].counter_name)) or -1
+        pfc_rx_counters[i].value = tonumber(redis.call('HGET', counters_table_name .. ':' .. port, pfc_rx_counters[i].counter_name)) or -1
+    end
+
+    -- Snapshot current time before the rate calculation
+    local currTime = redis.call('TIME')
+    local currTimeSec = tonumber(currTime[1])
+    local currTimeMicroSec = tonumber(currTime[2])
 
     if not in_ucast_pkts or not in_non_ucast_pkts or not out_ucast_pkts or
        not out_non_ucast_pkts or not in_octets or not out_octets then
@@ -308,13 +344,63 @@ local function compute_rate(port)
         local out_non_ucast_pkts_last = redis.call('HGET', rates_table_name .. ':' .. port, 'SAI_PORT_STAT_IF_OUT_NON_UCAST_PKTS_last')
         local in_octets_last = redis.call('HGET', rates_table_name .. ':' .. port, 'SAI_PORT_STAT_IF_IN_OCTETS_last')
         local out_octets_last = redis.call('HGET', rates_table_name .. ':' .. port, 'SAI_PORT_STAT_IF_OUT_OCTETS_last')
+        local last_update_time_sec = redis.call('HGET', rates_table_name .. ':' .. port, 'LAST_UPDATE_TIME_SEC')
+
+        if not last_update_time_sec then
+            logit("Last update time not found for " .. port)
+            return
+        end
+
+        for i = 0, 7 do
+            pfc_tx_counters[i].value_last = tonumber(redis.call('HGET', rates_table_name .. ':' .. port, pfc_tx_counters[i].counter_name_last)) or -1
+            pfc_rx_counters[i].value_last = tonumber(redis.call('HGET', rates_table_name .. ':' .. port, pfc_rx_counters[i].counter_name_last)) or -1
+        end
+
+        -- Use wall-clock time for accurate per-cycle rate scaling
+        -- currTime[1] = seconds since epoch, currTime[2] = microseconds part
+        currTime = redis.call('TIME')
+        currTimeSec = tonumber(currTime[1])
+        currTimeMicroSec = tonumber(currTime[2])
+
+        local time_delta = tonumber(currTimeSec) - tonumber(last_update_time_sec)
+        if time_delta <= 0 or time_delta > 20 then
+            -- Clock jumped or stale entry: reset baseline without emitting rates so
+            -- the next cycle has a valid reference point.
+            logit("Delta time is invalid for " .. port)
+            redis.call('HSET', rates_table_name .. ':' .. port, 'SAI_PORT_STAT_IF_IN_UCAST_PKTS_last', in_ucast_pkts)
+            redis.call('HSET', rates_table_name .. ':' .. port, 'SAI_PORT_STAT_IF_IN_NON_UCAST_PKTS_last', in_non_ucast_pkts)
+            redis.call('HSET', rates_table_name .. ':' .. port, 'SAI_PORT_STAT_IF_OUT_UCAST_PKTS_last', out_ucast_pkts)
+            redis.call('HSET', rates_table_name .. ':' .. port, 'SAI_PORT_STAT_IF_OUT_NON_UCAST_PKTS_last', out_non_ucast_pkts)
+            redis.call('HSET', rates_table_name .. ':' .. port, 'SAI_PORT_STAT_IF_IN_OCTETS_last', in_octets)
+            redis.call('HSET', rates_table_name .. ':' .. port, 'SAI_PORT_STAT_IF_OUT_OCTETS_last', out_octets)
+            for i = 0, 7 do
+                redis.call('HSET', rates_table_name .. ':' .. port, pfc_tx_counters[i].counter_name_last, pfc_tx_counters[i].value)
+                redis.call('HSET', rates_table_name .. ':' .. port, pfc_rx_counters[i].counter_name_last, pfc_rx_counters[i].value)
+            end
+            redis.call('HSET', rates_table_name .. ':' .. port, 'LAST_UPDATE_TIME_SEC', tostring(currTimeSec))
+            redis.call('HSET', rates_table_name .. ':' .. port, 'LAST_UPDATE_TIME_REM_MICROSEC', tostring(currTimeMicroSec))
+            return
+        end
 
         -- Calculate new rates values
-        local scale_factor = 1000 / delta
-        local rx_bps_new = (in_octets - in_octets_last) * scale_factor 
+        local scale_factor = 1000 / (time_delta * 1000)
+        local rx_bps_new = (in_octets - in_octets_last) * scale_factor
         local tx_bps_new = (out_octets - out_octets_last) * scale_factor
         local rx_pps_new = ((in_ucast_pkts + in_non_ucast_pkts) - (in_ucast_pkts_last + in_non_ucast_pkts_last)) * scale_factor
         local tx_pps_new = ((out_ucast_pkts + out_non_ucast_pkts) - (out_ucast_pkts_last + out_non_ucast_pkts_last)) * scale_factor
+
+        for i = 0, 7 do
+            if pfc_tx_counters[i].value_last ~= -1 and pfc_tx_counters[i].value ~= -1 then
+                pfc_tx_counters[i].rate = math.floor(pfc_tx_counters[i].value - pfc_tx_counters[i].value_last) * scale_factor
+            else
+                pfc_tx_counters[i].rate = -1
+            end
+            if pfc_rx_counters[i].value_last ~= -1 and pfc_rx_counters[i].value ~= -1 then
+                pfc_rx_counters[i].rate = math.floor(pfc_rx_counters[i].value - pfc_rx_counters[i].value_last) * scale_factor
+            else
+                pfc_rx_counters[i].rate = -1
+            end
+        end
 
         if initialized == "DONE" then
             -- Get old rates values
@@ -323,11 +409,25 @@ local function compute_rate(port)
             local tx_bps_old = redis.call('HGET', rates_table_name .. ':' .. port, 'TX_BPS')
             local tx_pps_old = redis.call('HGET', rates_table_name .. ':' .. port, 'TX_PPS')
 
+            for i = 0, 7 do
+                pfc_tx_counters[i].rate_last = tonumber(redis.call('HGET', rates_table_name .. ':' .. port, pfc_tx_counters[i].rate_name)) or -1
+                pfc_rx_counters[i].rate_last = tonumber(redis.call('HGET', rates_table_name .. ':' .. port, pfc_rx_counters[i].rate_name)) or -1
+            end
+
             -- Smooth the rates values and store them in DB
             redis.call('HSET', rates_table_name .. ':' .. port, 'RX_BPS', alpha*rx_bps_new + one_minus_alpha*rx_bps_old)
             redis.call('HSET', rates_table_name .. ':' .. port, 'RX_PPS', alpha*rx_pps_new + one_minus_alpha*rx_pps_old)
             redis.call('HSET', rates_table_name .. ':' .. port, 'TX_BPS', alpha*tx_bps_new + one_minus_alpha*tx_bps_old)
             redis.call('HSET', rates_table_name .. ':' .. port, 'TX_PPS', alpha*tx_pps_new + one_minus_alpha*tx_pps_old)
+
+            for i = 0, 7 do
+                if pfc_tx_counters[i].rate_last ~= -1 and pfc_tx_counters[i].rate ~= -1 then
+                    redis.call('HSET', rates_table_name .. ':' .. port, pfc_tx_counters[i].rate_name, math.floor(alpha*pfc_tx_counters[i].rate + one_minus_alpha*pfc_tx_counters[i].rate_last))
+                end
+                if pfc_rx_counters[i].rate_last ~= -1 and pfc_rx_counters[i].rate ~= -1 then
+                    redis.call('HSET', rates_table_name .. ':' .. port, pfc_rx_counters[i].rate_name, math.floor(alpha*pfc_rx_counters[i].rate + one_minus_alpha*pfc_rx_counters[i].rate_last))
+                end
+            end
         else
             -- Store unsmoothed initial rates values in DB
             redis.call('HSET', rates_table_name .. ':' .. port, 'RX_BPS', rx_bps_new)
@@ -335,19 +435,35 @@ local function compute_rate(port)
             redis.call('HSET', rates_table_name .. ':' .. port, 'TX_BPS', tx_bps_new)
             redis.call('HSET', rates_table_name .. ':' .. port, 'TX_PPS', tx_pps_new)
             redis.call('HSET', state_table, 'INIT_DONE', 'DONE')
+
+            for i = 0, 7 do
+                redis.call('HSET', rates_table_name .. ':' .. port, pfc_tx_counters[i].rate_name, pfc_tx_counters[i].rate)
+                redis.call('HSET', rates_table_name .. ':' .. port, pfc_rx_counters[i].rate_name, pfc_rx_counters[i].rate)
+            end
         end
+
+        redis.call('HSET', rates_table_name .. ':' .. port, 'LAST_UPDATE_TIME_SEC', tostring(currTimeSec))
+        redis.call('HSET', rates_table_name .. ':' .. port, 'LAST_UPDATE_TIME_REM_MICROSEC', tostring(currTimeMicroSec))
 
     else
         redis.call('HSET', state_table, 'INIT_DONE', 'COUNTERS_LAST')
     end
 
-    -- Set old COUNTERS values
+    -- Set current values as COUNTERS_last values
     redis.call('HSET', rates_table_name .. ':' .. port, 'SAI_PORT_STAT_IF_IN_UCAST_PKTS_last', in_ucast_pkts)
     redis.call('HSET', rates_table_name .. ':' .. port, 'SAI_PORT_STAT_IF_IN_NON_UCAST_PKTS_last', in_non_ucast_pkts)
     redis.call('HSET', rates_table_name .. ':' .. port, 'SAI_PORT_STAT_IF_OUT_UCAST_PKTS_last', out_ucast_pkts)
     redis.call('HSET', rates_table_name .. ':' .. port, 'SAI_PORT_STAT_IF_OUT_NON_UCAST_PKTS_last', out_non_ucast_pkts)
     redis.call('HSET', rates_table_name .. ':' .. port, 'SAI_PORT_STAT_IF_IN_OCTETS_last', in_octets)
     redis.call('HSET', rates_table_name .. ':' .. port, 'SAI_PORT_STAT_IF_OUT_OCTETS_last', out_octets)
+
+    for i = 0, 7 do
+        redis.call('HSET', rates_table_name .. ':' .. port, pfc_tx_counters[i].counter_name_last, pfc_tx_counters[i].value)
+        redis.call('HSET', rates_table_name .. ':' .. port, pfc_rx_counters[i].counter_name_last, pfc_rx_counters[i].value)
+    end
+
+    redis.call('HSET', rates_table_name .. ':' .. port, 'LAST_UPDATE_TIME_SEC', tostring(currTimeSec))
+    redis.call('HSET', rates_table_name .. ':' .. port, 'LAST_UPDATE_TIME_REM_MICROSEC', tostring(currTimeMicroSec))
 
 end
 
