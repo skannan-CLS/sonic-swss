@@ -1086,13 +1086,11 @@ void OrchDaemon::start(long heartBeatInterval)
         // Signal app-level readiness once:
         //   1. ports are initialized in hardware (PORT_CONFIG_DONE)
         //   2. all buffer PG/queue profiles have been applied to SAI
-        //   3. all ACL tables are bound to their ports and no ACL tasks remain pending
-        // Conditions 2 and 3 fire on the event cycle immediately after the last config
+        // Condition 2 fires on the event cycle immediately after the last buffer
         // task completes. sysmonitor waits for FEATURE|swss:up_status=true when
         // check_up_status=true is configured for swss.
         if (!m_swssReady && gPortsOrch && gPortsOrch->isConfigDone() &&
-            gBufferOrch && gBufferOrch->areAllPortsReady() &&
-            gAclOrch && gAclOrch->areAllTablesApplied())
+            gBufferOrch && gBufferOrch->areAllPortsReady())
         {
             try
             {
