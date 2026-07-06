@@ -274,6 +274,15 @@ bool BufferOrch::isPortReady(const std::string& port_name) const
     return result;
 }
 
+bool BufferOrch::areAllPortsReady() const
+{
+    for (const auto& kv : m_ready_list)
+    {
+        if (!kv.second) return false;
+    }
+    return true;
+}
+
 void BufferOrch::clearBufferPoolWatermarkCounterIdList(const sai_object_id_t object_id)
 {
     if (m_isBufferPoolWatermarkCounterIdListGenerated)

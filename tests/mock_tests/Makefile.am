@@ -34,6 +34,7 @@ tests_SOURCES = aclorch_ut.cpp \
                 routeorch_ut.cpp \
                 qosorch_ut.cpp \
                 bufferorch_ut.cpp \
+                swss_readiness_ut.cpp \
                 buffermgrdyn_ut.cpp \
                 fdborch/flush_syncd_notif_ut.cpp \
                 macmoveguard/macmoveguard_ut.cpp \

@@ -1,4 +1,5 @@
 #include <unistd.h>
+#include <ctime>
 #include <unordered_map>
 #include <chrono>
 #include <limits.h>
@@ -1081,6 +1082,33 @@ void OrchDaemon::start(long heartBeatInterval)
             for (Orch *o : m_orchList)
                 o->doTask();
         }
+
+        // Signal app-level readiness once:
+        //   1. ports are initialized in hardware (PORT_CONFIG_DONE)
+        //   2. all buffer PG/queue profiles have been applied to SAI
+        //   3. all ACL tables are bound to their ports and no ACL tasks remain pending
+        // Conditions 2 and 3 fire on the event cycle immediately after the last config
+        // task completes. sysmonitor waits for FEATURE|swss:up_status=true when
+        // check_up_status=true is configured for swss.
+        if (!m_swssReady && gPortsOrch && gPortsOrch->isConfigDone() &&
+            gBufferOrch && gBufferOrch->areAllPortsReady() &&
+            gAclOrch && gAclOrch->areAllTablesApplied())
+        {
+            try
+            {
+                m_stateDb->hset("FEATURE|swss", "up_status", "true");
+                m_stateDb->hset("FEATURE|swss", "update_time",
+                                std::to_string(std::time(nullptr)));
+                m_swssReady = true;
+                SWSS_LOG_NOTICE("orchagent: initial configuration complete, "
+                                "signalling app readiness (FEATURE|swss:up_status=true)");
+            }
+            catch (const std::exception &e)
+            {
+                SWSS_LOG_ERROR("Failed to set swss up_status: %s", e.what());
+            }
+        }
+
         /*
          * Asked to check warm restart readiness.
          * Not doing this under Select::TIMEOUT condition because of

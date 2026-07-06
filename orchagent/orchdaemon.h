@@ -127,6 +127,10 @@ protected:
     bool m_fabricEnabled = false;
     bool m_fabricPortStatEnabled = true;
     bool m_fabricQueueStatEnabled = true;
+    // Written to STATE_DB FEATURE|swss:up_status=true on the first idle timeout
+    // after PORT_CONFIG_DONE, so sysmonitor delays "System is ready" until
+    // orchagent has finished applying all initial configuration.
+    bool m_swssReady = false;
 
     std::vector<Orch *> m_orchList;
     Select *m_select;
